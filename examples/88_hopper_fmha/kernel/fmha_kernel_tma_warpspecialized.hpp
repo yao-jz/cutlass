@@ -159,6 +159,7 @@ struct FmhaKernelTmaWarpSpecialized {
     };
   }
 
+  template <int RoleFilter = 0>
   CUTLASS_DEVICE void operator()(const Params &params, char* smem) {
 #if ! defined(CUTLASS_ARCH_MMA_SM90A_ENABLED)
     CUTE_INVALID_CONTROL_PATH("ERROR : Arch conditional MMA instruction used without targeting appropriate compute capability. Aborting.\n");
@@ -194,6 +195,15 @@ struct FmhaKernelTmaWarpSpecialized {
     int consumer_warp_group_idx = warp_group_idx - (int) WarpGroupRole::Consumer0;
     int lane_predicate = cute::elect_one_sync();
     uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+
+    // FusionSmith integration hook: when a caller instantiates a single-role
+    // operator, run consumer-side setup under the consumer register allocation.
+    // RoleFilter=0 preserves the stock combined producer/consumer behavior.
+#if !defined(FS_CUTLASS_FMHA_DISABLE_SETMAXNREG)
+    if constexpr (RoleFilter == 2) {
+      cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+    }
+#endif
 
     // Issue Tma Descriptor Prefetch from a single thread
     if ((warp_idx == 0) && lane_predicate) {
@@ -289,8 +299,11 @@ struct FmhaKernelTmaWarpSpecialized {
 
     CollectiveMainloop collective_mainloop;
 
+    if constexpr (RoleFilter != 2) {
     if (warp_group_role == WarpGroupRole::Producer) {
+#if !defined(FS_CUTLASS_FMHA_DISABLE_SETMAXNREG)
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+#endif
       if (producer_warp_role == ProducerWarpRole::LoadKV) {
         bool do_barrier = kLoadsQSeparately;
 
@@ -333,13 +346,18 @@ struct FmhaKernelTmaWarpSpecialized {
         }
       }
     }
-    else if (
+    }
+
+    if constexpr (RoleFilter != 1) {
+    if (
       warp_group_role == WarpGroupRole::Consumer0 || 
       warp_group_role == WarpGroupRole::Consumer1 ||
       warp_group_role == WarpGroupRole::Consumer2 ||
       warp_group_role == WarpGroupRole::Consumer3
     ) {
+#if !defined(FS_CUTLASS_FMHA_DISABLE_SETMAXNREG)
       cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+#endif
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
         auto blk_coord = tile_scheduler.get_block_coord();
@@ -414,6 +432,7 @@ struct FmhaKernelTmaWarpSpecialized {
 
         if constexpr (kIsEpilogueLocked) ; math_wg_order_barrier.arrive();
       }
+    }
     }
 #endif
   }

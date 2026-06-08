@@ -79,6 +79,13 @@ struct DefaultFusion {
   ) {
     return;
   }
+
+  // FS hook: record this tile's (batch,head) block coord so a stateful fusion
+  // (e.g. AF PairBiasFusion) can resolve its per-head bias slice in
+  // before_softmax.  No-op for the stateless fusions — inlines to nothing, so
+  // the Wan/causal paths are byte-for-byte unchanged.
+  template<class BlkCoord>
+  CUTLASS_DEVICE static void set_head(BlkCoord const&) {}
 };
 
 struct ResidualFusion : DefaultFusion {

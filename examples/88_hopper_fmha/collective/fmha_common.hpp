@@ -168,9 +168,17 @@ CUTE_DEVICE auto constexpr convert_to_gmma_rs(cute::TiledMMA<Atom, Args...> cons
 
 template<typename CLayout, typename AValueShape>
 CUTE_DEVICE auto constexpr convert_c_layout_to_a_layout(CLayout const& c, AValueShape const& a) {
-  return make_layout(
-    make_shape(a, shape<1>(c), make_shape(shape<2>(c), size<0>(c) / size(a))),
-    make_stride(stride<0>(c), stride<1>(c), make_stride(stride<2>(c), size<2>(a) * stride<0,2>(c))));
+  if constexpr (decltype(rank(a))::value == 2) {
+    return make_layout(
+      make_shape(a, shape<1>(c), make_shape(shape<2>(c), size<0>(c) / size(a))),
+      make_stride(make_tuple(stride<0,0>(c), stride<0,1>(c)), stride<1>(c),
+                  make_stride(stride<2>(c), size<1>(a) * stride<0,1>(c))));
+  } else {
+    return make_layout(
+      make_shape(a, shape<1>(c), make_shape(shape<2>(c), size<0>(c) / size(a))),
+      make_stride(stride<0>(c), stride<1>(c),
+                  make_stride(stride<2>(c), size<2>(a) * stride<0,2>(c))));
+  }
 }
 
 template<class Layout, class Stages = _1>

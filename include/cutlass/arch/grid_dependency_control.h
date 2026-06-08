@@ -83,7 +83,8 @@ namespace arch {
 // while launching too late can lead to a long latency.
 CUTLASS_DEVICE
 void launch_dependent_grids() {
-#if (defined(CUTLASS_GDC_ENABLED))
+#if (defined(CUTLASS_GDC_ENABLED)) && \
+    !defined(PHANTOM_WAN_FSABI_DISABLE_GDC)
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
@@ -93,7 +94,8 @@ void launch_dependent_grids() {
 // when launching a dependent kernel earlier.
 CUTLASS_DEVICE
 void wait_on_dependent_grids() {
-#if (defined(CUTLASS_GDC_ENABLED))
+#if (defined(CUTLASS_GDC_ENABLED)) && \
+    !defined(PHANTOM_WAN_FSABI_DISABLE_GDC)
   asm volatile("griddepcontrol.wait;");
 #endif
 }

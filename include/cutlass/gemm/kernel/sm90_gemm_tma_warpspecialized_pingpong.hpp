@@ -351,6 +351,10 @@ public:
     return dim3(MaxThreadsPerBlock, 1, 1);
   }
 
+  // FS role-split (RoleFilter): 0 = original all-role body, 1 = producer-only,
+  // 2 = consumer-only.  This preserves CUTLASS's original setmaxnreg calls
+  // while giving ptxas role-specific compilation units inside the megakernel.
+  template <int RoleFilter = 0>
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
@@ -397,6 +401,14 @@ public:
     auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
     int lane_predicate = cute::elect_one_sync();
     uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+
+#if !defined(FS_CUTLASS_GEMM_DISABLE_SETMAXNREG)
+    // In the consumer-only instantiation, raise the register allocation before
+    // shared setup code so the math role keeps CUTLASS's intended budget.
+    if constexpr (RoleFilter == 2) {
+      cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+    }
+#endif
 
     // Issue Tma Descriptor Prefetch from a single thread
     if ((warp_idx == 0) && lane_predicate) {
@@ -572,17 +584,20 @@ public:
     // Wait for all thread blocks in the Cluster
     cluster_wait_fn();
 
+    if constexpr (RoleFilter != 2) {
     if (warp_group_role == WarpGroupRole::Producer) {
+#if !defined(FS_CUTLASS_GEMM_DISABLE_SETMAXNREG)
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+#endif
     
       // Scheduler Producer Warp
       if (producer_warp_role == ProducerWarpRole::Warp1) {
-        if constexpr (IsSchedDynamicPersistent) { 
+        if constexpr (IsSchedDynamicPersistent) {
           bool requires_clc_query = true;
           TileSchedulerPipelineState scheduler_pipe_producer_state = cutlass::make_producer_start_state<TileSchedulerPipeline>();
 
           while (work_tile_info.is_valid()) {
-            
+
             if (requires_clc_query) {
 
               // Throttle CLC query to mitigate workload imbalance caused by skews among persistent workers.
@@ -685,7 +700,7 @@ public:
         // Make sure all Consumer Warp Groups have been waited upon
         collective_mainloop.load_tail(mainloop_pipeline, mainloop_pipe_producer_state);
 
-        if constexpr (IsSchedDynamicPersistent) {  
+        if constexpr (IsSchedDynamicPersistent) {
           auto [next_work_tile_info, increment_pipe] = 
             scheduler.fetch_next_work(
                 work_tile_info, scheduler_pipeline, scheduler_pipe_consumer_state);
@@ -799,9 +814,15 @@ public:
         }
       } // Epilogue Producer Warp End
     } // Producer Warp Group End
+    } // end if constexpr (RoleFilter != 2)
 
-    else if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
-      cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+    if constexpr (RoleFilter != 1) {
+    if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
+#if !defined(FS_CUTLASS_GEMM_DISABLE_SETMAXNREG)
+      if constexpr (RoleFilter != 2) {
+        cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+      }
+#endif
 
       if constexpr (!IsSm120Family) {
         // It is possible to have work tiles start off invalid,
@@ -940,6 +961,7 @@ public:
         }
       } // Scheduler work fetch loop
     } // Consumer Warp Groups End
+    } // end if constexpr (RoleFilter != 1)
 #endif
   }
 };

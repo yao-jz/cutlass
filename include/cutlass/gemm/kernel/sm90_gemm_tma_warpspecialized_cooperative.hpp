@@ -352,6 +352,13 @@ public:
     return dim3(MaxThreadsPerBlock, 1, 1);
   }
 
+  // FS role-split (RoleFilter): 0 = both roles (original), 1 = producer-only,
+  // 2 = consumer-only.  Compiling each role as a separate instantiation lets
+  // ptxas give each its own full register budget (full TMA unroll + honored
+  // setmaxnreg), fixing the in-megakernel under-unrolled-TMA fault for WanCoop.
+  // See project_wan_cutlass_inmk_hang_2026_06_03.  Default 0 keeps all other
+  // cooperative-GEMM users byte-identical.
+  template <int RoleFilter = 0>
   CUTLASS_DEVICE
   void
   operator()(Params const& params, char* smem_buf) {
@@ -406,6 +413,11 @@ public:
     auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
     int lane_predicate = cute::elect_one_sync();
     uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+
+    // FS role-split hoist: in the consumer-only instantiation, raise the reg
+    // allocation BEFORE the shared pipeline-init setup so it runs at full
+    // headroom (RoleFilter==2 => all threads here are consumers).
+    if constexpr (RoleFilter == 2) cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
     // Issue Tma Descriptor Prefetch from a single thread
     if ((warp_idx == 0) && lane_predicate) {
@@ -556,6 +568,7 @@ public:
     // Wait for all thread blocks in the Cluster
     cluster_wait_fn();
 
+    if constexpr (RoleFilter != 2) {  // FS role-split: producer-only when 1
     if (warp_group_role == WarpGroupRole::Producer) {
       work_tile_info = scheduler.initial_work_tile_info(ClusterShape{});
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
@@ -765,10 +778,14 @@ public:
         collective_epilogue.load_tail(epi_load_pipeline, epi_load_pipe_producer_state);
       } // Epilogue Producer Warp End
     } // Producer Warp Group End
+    }  // end if constexpr (RoleFilter != 2)
 
-    else if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
+    if constexpr (RoleFilter != 1) {  // FS role-split: consumer-only when 2
+    if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
       work_tile_info = scheduler.initial_work_tile_info(ClusterShape{});
-      cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+      if constexpr (RoleFilter != 2) {
+        cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+      }
 
       CollectiveEpilogue collective_epilogue(params.epilogue, shared_storage.tensors.epilogue);
 
@@ -868,6 +885,7 @@ public:
         );
       }
     } // Consumer Warp Groups End
+    }  // end if constexpr (RoleFilter != 1)
 #endif
   }
 

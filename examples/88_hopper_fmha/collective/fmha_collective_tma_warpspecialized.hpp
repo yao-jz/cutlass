@@ -110,6 +110,10 @@ struct FmhaMainloopTmaWarpSpecialized {
 
   using TiledMmaQK = typename CollectiveMmaQK::TiledMma;
   using TiledMmaPV = decltype(convert_to_gmma_rs(typename CollectiveMmaPV::TiledMma{}));
+  using ElementSmemQ = typename TiledMmaQK::ValTypeA;
+  using ElementSmemK = typename TiledMmaQK::ValTypeB;
+  using ElementSmemV = typename TiledMmaPV::ValTypeB;
+  using ElementPVAccInput = typename TiledMmaPV::ValTypeA;
 
   using SmemLayoutQ = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutA{}, Int<StagesQ::value>{}));
   using SmemLayoutK = typename CollectiveMmaQK::SmemLayoutB;
@@ -129,10 +133,10 @@ struct FmhaMainloopTmaWarpSpecialized {
   using ElementOut = ElementAccumulatorPV;
 
   struct SharedStorage {
-    cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+    cute::array_aligned<ElementSmemQ, cute::cosize_v<SmemLayoutQ>> smem_q;
     union {
-      cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
-      cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
+      cute::array_aligned<ElementSmemK, cute::cosize_v<SmemLayoutK>> smem_k;
+      cute::array_aligned<ElementSmemV, cute::cosize_v<SmemLayoutV>> smem_v;
     };
   };
 
@@ -162,7 +166,7 @@ struct FmhaMainloopTmaWarpSpecialized {
   using LoadQ = cutlass::fmha::collective::CollectiveLoadTma<
     cutlass::fmha::collective::LoadKind::kQ,
     MainloopPipelineQ,
-    Element,
+    ElementSmemQ,
     SmemLayoutQ,
     TMA_Q
   >;
@@ -170,7 +174,7 @@ struct FmhaMainloopTmaWarpSpecialized {
   using LoadK = cutlass::fmha::collective::CollectiveLoadTma<
     cutlass::fmha::collective::LoadKind::kK,
     MainloopPipeline,
-    Element,
+    ElementSmemK,
     SmemLayoutK,
     TMA_K
   >;
@@ -178,7 +182,7 @@ struct FmhaMainloopTmaWarpSpecialized {
   using LoadV = cutlass::fmha::collective::CollectiveLoadTma<
     cutlass::fmha::collective::LoadKind::kV,
     MainloopPipeline,
-    Element,
+    ElementSmemV,
     SmemLayoutV,
     TMA_V
   >;
@@ -387,6 +391,10 @@ struct FmhaMainloopTmaWarpSpecialized {
     // Allocate PV acc
     Tensor acc_pv = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV{}));
 
+    // FS hook: publish this tile's (batch,head) block coord for stateful fusions
+    // (AF PairBiasFusion reads the head to pick its bias slice).  No-op for
+    // stateless fusions (DefaultFusion::set_head is empty -> Wan path unchanged).
+    Fusion::set_head(blk_coord);
     cutlass::fmha::collective::CollectiveSoftmax<ElementAccumulatorQK, Fusion, decltype(params)> softmax{params};
     auto softmax_state = softmax.init(acc_pv, tiled_mma_pv);
 
@@ -415,7 +423,7 @@ struct FmhaMainloopTmaWarpSpecialized {
 
         softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state, problem_size);
   
-        Tensor acc_qk_fixed = make_acc_into_op<Element>(acc_qk, typename TiledMmaPV::LayoutA_TV{});
+        Tensor acc_qk_fixed = make_acc_into_op<ElementPVAccInput>(acc_qk, typename TiledMmaPV::LayoutA_TV{});
   
         pipeline.consumer_wait(smem_pipe_read);
 
@@ -464,7 +472,7 @@ struct FmhaMainloopTmaWarpSpecialized {
         softmax.template step<false>(acc_qk, tiled_mma_qk, tPcP, softmax_state, acc_pv, tiled_mma_pv, problem_size);
         if constexpr (kIsMainloopLocked) math_wg_order_barrier.arrive();
 
-        Tensor acc_qk_fixed = make_acc_into_op<Element>(acc_qk, typename TiledMmaPV::LayoutA_TV{});
+        Tensor acc_qk_fixed = make_acc_into_op<ElementPVAccInput>(acc_qk, typename TiledMmaPV::LayoutA_TV{});
   
         pipeline.consumer_wait(smem_pipe_read, tok);
 
@@ -520,7 +528,7 @@ struct FmhaMainloopTmaWarpSpecialized {
         softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state, acc_pv, tiled_mma_pv, problem_size);
         if constexpr (kIsMainloopLocked) math_wg_order_barrier.arrive();
 
-        Tensor acc_qk_fixed = make_acc_into_op<Element>(acc_qk, typename TiledMmaPV::LayoutA_TV{});
+        Tensor acc_qk_fixed = make_acc_into_op<ElementPVAccInput>(acc_qk, typename TiledMmaPV::LayoutA_TV{});
   
         pipeline.consumer_wait(smem_pipe_read, tok);
 
