@@ -145,10 +145,14 @@ struct CausalFusion : DefaultFusion {
     TileShape const& tile_shape,
     ProblemSize const& problem_size
   ) {
-    // See note below on different ways to think about causal attention
-    // Again, we'd add the offset_q into the max_blocks_q calculation
+    // BOTTOM-RIGHT causal (FusionSmith 2026-06-18): offset_q = seqlen_k - seqlen_q so
+    // a query at row q attends keys [0, q+offset_q] (inference/verify: the candidates
+    // sit at the END of the KV, attending the cached prefix).  For Q==K (prefill/LATS)
+    // offset_q==0 → byte-identical to the original top-left causal (golden preserved).
+    int offset_q = get<3>(problem_size) - get<2>(problem_size);
     int max_blocks_k = Base::get_trip_count(blk_coord, tile_shape, problem_size);
-    int max_blocks_q = ceil_div((get<0>(blk_coord) + 1) * get<0>(tile_shape), get<1>(tile_shape));
+    int max_blocks_q = ceil_div(
+        (get<0>(blk_coord) + 1) * get<0>(tile_shape) + offset_q, get<1>(tile_shape));
     return std::min(max_blocks_k, max_blocks_q);
   }
 
@@ -179,18 +183,18 @@ struct CausalFusion : DefaultFusion {
     IndexQK const& index_qk,
     ProblemSize const& problem_size
   ) {
-    // There are two ways to do causal if N_Q != N_K
-    // (1) is to assume that the Q is at the beginning of the matrix
-    //    - this is what we demonstrate here
-    // (2) is that it is at the end of the matrix
-    //    - this is usually what we want for inference settings
-    //      where we only compute the next row and use cache for the rest
-    //    - if you'd like this, you only need to add an offset like so:
-    //      get<0>(pos) + offset_q < get<1>(pos)
+    // BOTTOM-RIGHT causal (FusionSmith 2026-06-18): case (2) from the CUTLASS note —
+    // Q at the END of the matrix (inference/verify), so query q attends keys
+    // [0, q+offset_q] with offset_q = seqlen_k - seqlen_q.  For Q==K (prefill/LATS)
+    // offset_q==0 → identical to the original top-left mask (get<0>(pos) < get<1>(pos)),
+    // preserving golden.  For the spec verify (Q=NCAND << K=L+Ppad) this is what makes
+    // candidate i attend the full cached prefix [0, L+i] (the original top-left mask had
+    // candidate 0 attend only key 0 → wrong token; root cause of the token-25 mismatch).
+    int offset_q = get<3>(problem_size) - get<2>(problem_size);
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(acc_qk); i++) {
       auto pos = index_qk(i);
-      if (get<0>(pos) < get<1>(pos)) {
+      if (get<0>(pos) + offset_q < get<1>(pos)) {
         acc_qk(i) = -INFINITY;
       }
     }
