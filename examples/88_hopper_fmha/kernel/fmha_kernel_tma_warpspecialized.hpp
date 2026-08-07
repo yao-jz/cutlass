@@ -101,6 +101,81 @@ struct FmhaKernelTmaWarpSpecialized {
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
+#if defined(PHANTOM_CAUSAL_FMHA_INVALIDATE_BARRIERS)
+private:
+  template <class Barrier>
+  CUTLASS_DEVICE static void phantomlink_invalidate_barrier(Barrier& barrier) {
+    // CUTLASS barrier wrappers are an in-place view of one SM90 mbarrier word.
+    // Keep this assertion next to the cast: silently accepting a wrapper layout
+    // change would invalidate an unrelated shared-memory address.
+    static_assert(sizeof(Barrier) == sizeof(uint64_t));
+    cutlass::arch::ClusterBarrier::invalidate(
+        reinterpret_cast<uint64_t const*>(&barrier));
+  }
+
+public:
+  // A normal CUDA kernel can leave its shared-memory objects to the kernel
+  // boundary.  A PhantomLink donor instead returns into another device body,
+  // which immediately repurposes the same dynamic-SMEM arena.  PTX requires
+  // every valid mbarrier object to be invalidated before that repurposing.
+  //
+  // This cleanup is intentionally limited to the reviewed single-CTA cluster
+  // launch contract.  Clustered donors need a separate remote-arrival/exit
+  // proof before their barriers can be invalidated safely.
+  CUTLASS_DEVICE static void phantomlink_invalidate_smem_barriers(char* smem) {
+    static_assert(cute::size(ClusterShape{}) == 1,
+                  "PhantomLink FMHA barrier cleanup requires cluster size 1");
+    auto& storage = *reinterpret_cast<SharedStorage*>(smem);
+
+    // The caller invokes this only after all FMHA roles returned and all async
+    // work was drained.  Converge the CTA once more around the single-thread
+    // invalidation so no warp can enter the grafted continuation early.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int stage = 0; stage < MainloopPipelineInner::Stages; ++stage) {
+        phantomlink_invalidate_barrier(
+            storage.pipeline_storage_inner.full_barrier_[stage]);
+        phantomlink_invalidate_barrier(
+            storage.pipeline_storage_inner.empty_barrier_[stage]);
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int stage = 0; stage < MainloopPipelineOuter::Stages; ++stage) {
+        phantomlink_invalidate_barrier(
+            storage.pipeline_storage_outer.full_barrier_[stage]);
+        phantomlink_invalidate_barrier(
+            storage.pipeline_storage_outer.empty_barrier_[stage]);
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int stage = 0; stage < MainloopPipelineReducer::Stages; ++stage) {
+        phantomlink_invalidate_barrier(
+            storage.pipeline_storage_reducer.full_barrier_[stage]);
+        phantomlink_invalidate_barrier(
+            storage.pipeline_storage_reducer.empty_barrier_[stage]);
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int depth = 0; depth < StagesPerMathWarpGroup; ++depth) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int group = 0; group < NumMmaWarpGroups; ++group) {
+          phantomlink_invalidate_barrier(
+              storage.math_wg_order.barrier_[depth][group]);
+        }
+      }
+      if constexpr (kLoadsQSeparately) {
+        phantomlink_invalidate_barrier(storage.load_warp_barrier);
+      }
+
+      using EpiLoadPipeline = typename CollectiveEpilogue::LoadPipeline;
+      CUTLASS_PRAGMA_UNROLL
+      for (int stage = 0; stage < EpiLoadPipeline::Stages; ++stage) {
+        phantomlink_invalidate_barrier(storage.epi_load.full_barrier_[stage]);
+        phantomlink_invalidate_barrier(storage.epi_load.empty_barrier_[stage]);
+      }
+    }
+    __syncthreads();
+  }
+#endif
+
   using ProblemShape = cute::tuple<int, int, int, int, int>;
 
   struct Arguments {
@@ -320,6 +395,21 @@ struct FmhaKernelTmaWarpSpecialized {
           );
           do_barrier = false;
         }
+#if defined(PHANTOM_CAUSAL_FMHA_PRODUCER_TAIL)
+        // CUTLASS's PipelineTmaAsync contract requires the producer tail before
+        // kernel exit.  A PhantomLink donor has an even stricter boundary: it
+        // returns into another device body on the same CTA.  Match CUTLASS's
+        // standard load_tail pattern and let only the elected TMA producer lane
+        // wait on the empty barriers.  The current causal configuration loads Q
+        // on a separate warp, while the constexpr arm keeps the combined-load
+        // form correct for other reviewed instantiations.
+        if (lane_predicate) {
+          pipeline_inner.producer_tail(smem_pipe_write_inner);
+          if constexpr (!kLoadsQSeparately) {
+            pipeline_outer.producer_tail(smem_pipe_write_outer);
+          }
+        }
+#endif
       }
       else if (kLoadsQSeparately && (producer_warp_role == ProducerWarpRole::MaybeLoadQ)) {
         bool do_barrier = true;
@@ -335,6 +425,14 @@ struct FmhaKernelTmaWarpSpecialized {
           );
           do_barrier = false;
         }
+#if defined(PHANTOM_CAUSAL_FMHA_PRODUCER_TAIL)
+        // This warp is the sole producer for the separately loaded Q pipeline.
+        // Use the exact producer state advanced by load_maybe_q(); a fresh or
+        // consumer state can wait on the wrong phase and deadlock the CTA.
+        if (lane_predicate) {
+          pipeline_outer.producer_tail(smem_pipe_write_outer);
+        }
+#endif
       } else if (producer_warp_role == ProducerWarpRole::Reducer) {
         for (; tile_scheduler.is_valid(); ++tile_scheduler) {
           auto blk_coord = tile_scheduler.get_block_coord();
