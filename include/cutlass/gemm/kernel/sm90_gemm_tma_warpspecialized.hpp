@@ -402,8 +402,28 @@ public:
     Tensor gB_nkl = get<1>(load_inputs);
 
     // Compute m_coord, n_coord, and l_coord with their post-tiled shapes
+#if defined(FS_CUTLASS_FLATTEN_IMPLICIT_CONV_GRID_X)
+    // FusionSmith's persistent kernel has a 1-D physical grid, while the SM90
+    // implicit-conv kernel normally maps M/N tiles through blockIdx.{x,y}.
+    // Flatten only ConvProblemShape grids, preserving the original GEMM path.
+    // Colexicographic M-major order matches a CUDA launch with
+    // grid.x=tiles_m, grid.y=tiles_n flattened into one logical work index.
+    auto block_mn = [&] {
+      if constexpr (IsConvProblemShape) {
+        int tiles_m = int(size(shape<2>(gA_mkl)));
+        return make_tuple(int(blockIdx.x) % tiles_m,
+                          int(blockIdx.x) / tiles_m);
+      }
+      else {
+        return make_tuple(int(blockIdx.x), int(blockIdx.y));
+      }
+    } ();
+    auto m_coord = idx2crd(get<0>(block_mn), shape<2>(gA_mkl));
+    auto n_coord = idx2crd(get<1>(block_mn), shape<2>(gB_nkl));
+#else
     auto m_coord = idx2crd(int(blockIdx.x), shape<2>(gA_mkl));
     auto n_coord = idx2crd(int(blockIdx.y), shape<2>(gB_nkl));
+#endif
     // handles the difference between the rank of Tensor returned by load_input in case they do not have a batch mode
     auto l_coord = [&] (auto const& gB_nkl_) {
       // gB_nkl needs to be passed into the lambda because C++17

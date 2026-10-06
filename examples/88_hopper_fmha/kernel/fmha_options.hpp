@@ -66,6 +66,11 @@ enum class Tag {
   kStagesQ,
   kStagesKV,
 
+  // Represent Q as q_hi + q_residual, both in Element precision.  The TMA
+  // producer registers both copies on one Q-pipeline transaction barrier and
+  // the consumer accumulates two QK MMAs into the same FP32 accumulator.
+  kCompensatedQ,
+
   kEpilogueKind,
 
   kBlocksPerSM,

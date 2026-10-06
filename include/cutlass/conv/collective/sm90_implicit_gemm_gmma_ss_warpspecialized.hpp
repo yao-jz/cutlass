@@ -239,12 +239,35 @@ private:
           cute::reverse(shape(problem_shape.dilation)));
     }
     else {
+#if defined(FS_CUTLASS_FLATTEN_PACKED_FILTER_TMA)
+      // FS board-conv compatibility path: a packed KTRSC/KRSC filter is
+      // logically the same contiguous (N, K) matrix consumed by the implicit
+      // GEMM.  Keeping the spatial/channel modes hierarchical makes CuTe's
+      // 2-D CTA tile composition retain run-time extent types, so TMA's static
+      // tile-size checks cannot form Copy_Traits.  Flatten only the packed
+      // inner filter modes here; callers enabling this gate must enforce the
+      // packed-filter contract before building Params.
+      auto const& shape_b = shape(tensor_b);
+      auto const& stride_b = stride(tensor_b);
+      auto tensor_b_flat = make_tensor(
+          tensor_b.data(),
+          make_layout(
+              make_shape(get<0>(shape_b), product(get<1>(shape_b))),
+              make_stride(get<0>(stride_b), get<1,0>(stride_b))));
+      return make_tma_copy(
+          GmemTiledCopyB{},
+          tensor_b_flat,
+          SmemLayoutB{}(_,_,_0{}),
+          make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
+          size<0>(ClusterShape{}));
+#else
       return make_tma_copy(
           GmemTiledCopyB{},
           tensor_b,
           SmemLayoutB{}(_,_,_0{}),
           make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
           size<0>(ClusterShape{}));
+#endif
     }
   }
 
@@ -528,7 +551,12 @@ public:
     // TMA requires special handling of strides to deal with coord codomain mapping
     // Represent the full tensors -- get these from TMA
     Tensor mA_mk = mainloop_params.tma_load_a.get_tma_tensor(make_shape(M,K));                            // (m,k)
+#if defined(FS_CUTLASS_FLATTEN_PACKED_FILTER_TMA)
+    Tensor mB_nk = mainloop_params.tma_load_b.get_tma_tensor(
+        make_shape(N, product(K)));                                                                       // (n,k-flat)
+#else
     Tensor mB_nk = mainloop_params.tma_load_b.get_tma_tensor(make_shape(N,K));                            // (n,k)
+#endif
 
     // Make tiled views, defer the slice
     Tensor gA_mk = local_tile(mA_mk, TileShape{}, make_coord(_,_,_), Step<_1, X,_1>{});        // (BLK_M,BLK_K,m,k)
@@ -621,7 +649,17 @@ public:
         int write_stage = smem_pipe_producer_state.index();
 
         copy(mainloop_params.tma_load_a.with(*tma_barrier, mcast_mask_a), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
+#if defined(FS_CUTLASS_FLATTEN_PACKED_FILTER_TMA)
+        // A's TMA-IM2COL iterator deliberately retains the hierarchical
+        // spatial/channel K coordinate.  The packed filter descriptor above
+        // is flat, so index B with the equivalent colexicographic tile
+        // ordinal.  Deriving the ordinal from the iterator's own shape keeps
+        // descriptor construction and traversal order congruent.
+        auto flat_k_tile = cute::crd2idx(*k_tile_iter, k_tile_iter.shape);
+        copy(mainloop_params.tma_load_b.with(*tma_barrier, mcast_mask_b), tBgB(_,_,_,flat_k_tile), tBsB(_,_,_,write_stage));
+#else
         copy(mainloop_params.tma_load_b.with(*tma_barrier, mcast_mask_b), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
+#endif
         ++k_tile_iter;
 
         // Advance smem_pipe_producer_state

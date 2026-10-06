@@ -348,7 +348,16 @@ public:
 
       if (cluster_size == 1) {
         is_signaling_thread_ = true;
+#if defined(FS_CUTLASS_VIRTUAL_CLUSTER_SIZE_ONE) && \
+    (FS_CUTLASS_VIRTUAL_CLUSTER_SIZE_ONE + 0)
+        // ClusterShape=1 means signal this CTA's own empty barrier.  The
+        // Fusion Smith native-2D wrapper happens to place that independent
+        // source CTA inside a physical cluster, where remote-mbarrier IDs are
+        // hardware ranks rather than logical CUTLASS ranks.
+        dst_blockid_ = cute::block_rank_in_cluster();
+#else
         dst_blockid_ = 0;
+#endif
       }
       else {
         // STEP 1 : Use Cute Layout function to generate an optimal dst block-id (0-15)

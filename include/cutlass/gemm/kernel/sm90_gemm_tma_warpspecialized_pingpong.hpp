@@ -400,7 +400,18 @@ public:
     auto warp_group_role = WarpGroupRole(canonical_warp_group_idx());
     auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
     int lane_predicate = cute::elect_one_sync();
+#if defined(FS_CUTLASS_VIRTUAL_CLUSTER_SIZE_ONE) && \
+    (FS_CUTLASS_VIRTUAL_CLUSTER_SIZE_ONE + 0)
+    // Fusion Smith's reviewed native-2D wrapper uses a physical 4-CTA cluster
+    // solely to reproduce a donor launch envelope.  Each inlined CUTLASS body
+    // is still an independent ClusterShape=1 kernel, so exposing hardware rank
+    // 1..3 here would create out-of-shape TMA slices and remote barrier IDs.
+    static_assert(size(ClusterShape{}) == 1,
+                  "virtual CUTLASS cluster identity requires ClusterShape=1");
+    uint32_t block_rank_in_cluster = 0u;
+#else
     uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+#endif
 
 #if !defined(FS_CUTLASS_GEMM_DISABLE_SETMAXNREG)
     // In the consumer-only instantiation, raise the register allocation before
@@ -486,6 +497,9 @@ public:
     if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
       epi_load_pipeline_params.role = EpiLoadPipeline::ThreadCategory::Consumer;
     }
+    // A ClusterShape=1 epilogue signals its own barrier.  Under the reviewed
+    // virtual-cluster wrapper, "self" is the current *physical* cluster rank;
+    // using logical rank zero here would redirect ranks 1..3 to CTA 0.
     epi_load_pipeline_params.dst_blockid = cute::block_rank_in_cluster();
     epi_load_pipeline_params.producer_arv_count = NumThreadsPerWarp;
     epi_load_pipeline_params.consumer_arv_count = NumThreadsPerWarpGroup;

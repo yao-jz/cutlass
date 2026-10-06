@@ -137,12 +137,25 @@ public:
     // MSVC requires protecting use of CUDA-specific nonstandard syntax,
     // like blockIdx and gridDim, with __CUDA_ARCH__.
 #if defined(__CUDA_ARCH__)
+#if defined(FS_CUTLASS_VIRTUAL_CLUSTER_SIZE_ONE) && \
+    (FS_CUTLASS_VIRTUAL_CLUSTER_SIZE_ONE + 0)
+    // Fusion Smith assigns source work with one row-major logical CTA id:
+    // x + grid_x * (y + grid_y * z).  CUTLASS's ordinary AlongM launch order
+    // (x * grid_y + y) is only a permutation for a full grid; it drops owners
+    // when the surrounding persistent plan activates a prefix of that logical
+    // grid.  Seed both CUTLASS raster orders from the attested FS id instead;
+    // get_work_idx_m_and_n still applies the requested M/N raster mapping.
+    current_work_linear_idx_ =
+        uint64_t(blockIdx.x) + uint64_t(gridDim.x) *
+        (uint64_t(blockIdx.y) + uint64_t(gridDim.y) * uint64_t(blockIdx.z));
+#else
     if (params_.raster_order_ == RasterOrder::AlongN) {
       current_work_linear_idx_ = uint64_t(blockIdx.x) + uint64_t(blockIdx.y) * uint64_t(gridDim.x);
     }
     else {
       current_work_linear_idx_ = uint64_t(blockIdx.x) * uint64_t(gridDim.y) + uint64_t(blockIdx.y);
     }
+#endif
 
     total_grid_size_ = uint64_t(gridDim.x) * uint64_t(gridDim.y) * uint64_t(gridDim.z);
 #else

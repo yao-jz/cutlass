@@ -45,6 +45,25 @@ using namespace cute;
 using cutlass::fmha::kernel::Tag;
 using cutlass::fmha::kernel::find_option_t;
 
+// Empty-base optimization keeps the default collective's Params and shared
+// storage layouts unchanged.  Only a kCompensatedQ instantiation owns the
+// second TMA descriptor and Q tile.
+template<bool Enabled, class TMA>
+struct FmhaCompensatedQParamsStorage {};
+
+template<class TMA>
+struct FmhaCompensatedQParamsStorage<true, TMA> {
+  TMA tma_load_q_residual;
+};
+
+template<bool Enabled, class Element, int Count>
+struct FmhaCompensatedQSharedStorage {};
+
+template<class Element, int Count>
+struct FmhaCompensatedQSharedStorage<true, Element, Count> {
+  cute::array_aligned<Element, Count> smem_q_residual;
+};
+
 template<
   class Element_,
   class ElementAccumulatorQK_,
@@ -68,6 +87,8 @@ struct FmhaMainloopTmaWarpSpecialized {
   // Options
   static constexpr bool kIsPersistent = find_option_t<Tag::kIsPersistent, false_type, Options...>::value;
   static constexpr bool kIsMainloopLocked = find_option_t<Tag::kIsMainloopLocked, false_type, Options...>::value;
+  static constexpr bool kLoadsQSeparately = find_option_t<Tag::kLoadsQSeparately, false_type, Options...>::value;
+  static constexpr bool kCompensatedQ = find_option_t<Tag::kCompensatedQ, false_type, Options...>::value;
 
   static constexpr int NumLoadWarpGroups = 1;
   static constexpr int NumMmaWarpGroups = find_option_t<Tag::kNumMmaWarpGroups, Int<2>, Options...>::value;
@@ -80,6 +101,8 @@ struct FmhaMainloopTmaWarpSpecialized {
   using ClusterShape = Shape<_1, _1, _1>;
   static_assert(StagesQ::value >= NumMmaWarpGroups);
   static_assert(Stages::value >= 2);
+  static_assert(!kCompensatedQ || kLoadsQSeparately,
+                "compensated Q requires the separately loaded Q pipeline");
 
   // 16B alignment lets us use TMA
   static constexpr int Alignment = 16 / sizeof(Element);
@@ -126,23 +149,38 @@ struct FmhaMainloopTmaWarpSpecialized {
   using PipelineStateQ  = typename cutlass::PipelineState<MainloopPipelineQ::Stages>;
 
   static constexpr int kInnerLoadBytes = size(SmemLayoutK{}(_,_,_0{})) * sizeof(Element);
-  static constexpr int kOuterLoadBytes = size(SmemLayoutQ{}(_,_,_0{})) * sizeof(Element);
+  static constexpr int kOuterLoadBytes =
+      size(SmemLayoutQ{}(_,_,_0{})) * sizeof(Element) *
+      (kCompensatedQ ? 2 : 1);
 
   using TileShapeOut = TileShapePV;
   using TiledMmaOut = TiledMmaPV;
   using ElementOut = ElementAccumulatorPV;
 
-  struct SharedStorage {
+  using CompensatedQSharedStorage = FmhaCompensatedQSharedStorage<
+      kCompensatedQ, ElementSmemQ, cute::cosize_v<SmemLayoutQ>>;
+
+  struct SharedStorage : CompensatedQSharedStorage {
     cute::array_aligned<ElementSmemQ, cute::cosize_v<SmemLayoutQ>> smem_q;
     union {
       cute::array_aligned<ElementSmemK, cute::cosize_v<SmemLayoutK>> smem_k;
       cute::array_aligned<ElementSmemV, cute::cosize_v<SmemLayoutV>> smem_v;
     };
+
+    CUTLASS_DEVICE ElementSmemQ* q_residual_data() {
+      if constexpr (kCompensatedQ) {
+        return this->smem_q_residual.data();
+      } else {
+        return smem_q.data();
+      }
+    }
   };
 
   struct Arguments {
     const Element* ptr_Q;
     LayoutQ dQ;
+    const Element* ptr_Q_residual;
+    LayoutQ dQ_residual;
     const Element* ptr_K;
     LayoutK dK;
     const Element* ptr_V;
@@ -153,7 +191,10 @@ struct FmhaMainloopTmaWarpSpecialized {
   using TMA_K = typename CollectiveMmaQK::Params::TMA_B;
   using TMA_V = typename CollectiveMmaPV::Params::TMA_B;
 
-  struct Params {
+  using CompensatedQParamsStorage =
+      FmhaCompensatedQParamsStorage<kCompensatedQ, TMA_Q>;
+
+  struct Params : CompensatedQParamsStorage {
     TMA_Q tma_load_q;
     TMA_K tma_load_k;
     TMA_V tma_load_v;
@@ -192,6 +233,7 @@ struct FmhaMainloopTmaWarpSpecialized {
   template<class ProblemShape>
   static bool can_implement(ProblemShape const& problem_size, Arguments const& args) {
     return true
+      && (!kCompensatedQ || args.ptr_Q_residual != nullptr)
       && (get<4>(problem_size) <= get<2>(TileShape{}))
       && ((get<4>(problem_size) % Alignment) == 0)
       && ((get<2>(problem_size) % Alignment) == 0)
@@ -208,6 +250,18 @@ struct FmhaMainloopTmaWarpSpecialized {
             args.ptr_K, args.dK,
         }, /*workspace=*/ nullptr);
 
+    Params result{};
+    result.tma_load_q = params_qk.tma_load_a;
+    if constexpr (kCompensatedQ) {
+      auto params_qk_residual = CollectiveMmaQK::to_underlying_arguments(
+          problem_shape_qk,
+          typename CollectiveMmaQK::Arguments {
+              args.ptr_Q_residual, args.dQ_residual,
+              args.ptr_K, args.dK,
+          }, /*workspace=*/ nullptr);
+      result.tma_load_q_residual = params_qk_residual.tma_load_a;
+    }
+
     auto problem_shape_pv = select<0,2,1,3>(problem_shape_qk);
     auto params_pv = CollectiveMmaPV::to_underlying_arguments(problem_shape_pv,
         typename CollectiveMmaPV::Arguments {
@@ -215,19 +269,22 @@ struct FmhaMainloopTmaWarpSpecialized {
             args.ptr_V, select<1,0,2>(args.dV),
         }, /*workspace=*/ nullptr);
 
-    return Params{
-        params_qk.tma_load_a,
-        params_qk.tma_load_b,
-        params_pv.tma_load_b,
-        1.0f / (float) std::sqrt(get<4>(problem_size)),
-        (float) (std::log2(std::exp(1.0)) / std::sqrt(get<4>(problem_size))),
-        1.0f
-    };
+    result.tma_load_k = params_qk.tma_load_b;
+    result.tma_load_v = params_pv.tma_load_b;
+    result.scale_softmax = 1.0f / (float) std::sqrt(get<4>(problem_size));
+    result.scale_softmax_log2 =
+        (float) (std::log2(std::exp(1.0)) / std::sqrt(get<4>(problem_size)));
+    result.rp_dropout = 1.0f;
+    return result;
   }
 
   CUTLASS_DEVICE
   static void prefetch_tma_descriptors(Params const& params) {
     cute::prefetch_tma_descriptor(params.tma_load_q.get_tma_descriptor());
+    if constexpr (kCompensatedQ) {
+      cute::prefetch_tma_descriptor(
+          params.tma_load_q_residual.get_tma_descriptor());
+    }
     cute::prefetch_tma_descriptor(params.tma_load_k.get_tma_descriptor());
     cute::prefetch_tma_descriptor(params.tma_load_v.get_tma_descriptor());
   }
@@ -320,14 +377,44 @@ struct FmhaMainloopTmaWarpSpecialized {
 
     auto q_tile_iter = cute::make_coord_iterator(Int<NumMmaWarpGroups>{});
 
-    CUTLASS_PRAGMA_UNROLL
-    for (int q_tile_count = 0; q_tile_count < NumMmaWarpGroups; q_tile_count++) {
-      int count = 1;
-      load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, count);
-      if (q_tile_count == 0 && do_barrier) {
-        load_warp_barrier.arrive();
-        load_warp_barrier.wait(/*phase=*/ 0);
-        do_barrier = false;
+    if constexpr (kCompensatedQ) {
+      LoadQ load_q_residual{
+          params.tma_load_q_residual, pipeline_q,
+          storage.smem_q_residual};
+      auto load_state_q_residual = load_q_residual.init_state(
+          _0{}, problem_size, TileShapeQK{}, blk_coord, NumMmaWarpGroups);
+      CUTLASS_PRAGMA_UNROLL
+      for (int q_tile_count = 0; q_tile_count < NumMmaWarpGroups;
+           q_tile_count++) {
+        // Both TMA copies contribute bytes to the same full barrier.  Advance
+        // the iterator/pipeline only after the residual copy, so one consumer
+        // wait publishes a matched {q_hi,q_residual} stage.
+        int hi_count = 1;
+        load_q.template step<false, false, true>(
+            q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate,
+            hi_count);
+        int residual_count = 1;
+        load_q_residual.template step<true, true, false>(
+            q_tile_iter, load_state_q_residual, smem_pipe_write_q,
+            lane_predicate, residual_count);
+        if (q_tile_count == 0 && do_barrier) {
+          load_warp_barrier.arrive();
+          load_warp_barrier.wait(/*phase=*/ 0);
+          do_barrier = false;
+        }
+      }
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int q_tile_count = 0; q_tile_count < NumMmaWarpGroups;
+           q_tile_count++) {
+        int count = 1;
+        load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q,
+                    lane_predicate, count);
+        if (q_tile_count == 0 && do_barrier) {
+          load_warp_barrier.arrive();
+          load_warp_barrier.wait(/*phase=*/ 0);
+          do_barrier = false;
+        }
       }
     }
   }
@@ -361,11 +448,15 @@ struct FmhaMainloopTmaWarpSpecialized {
   
     // Mainloop setup QK
     Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
+    Tensor sQResidual = make_tensor(
+        make_smem_ptr(storage.q_residual_data()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
   
     Tensor tSsQ = thr_mma_qk.partition_A(sQ);                                   // (MMA,MMA_M,MMA_K,PIPE)
     Tensor tSsK = thr_mma_qk.partition_B(sK);                                   // (MMA,MMA_N,MMA_K,PIPE)
     Tensor tSrQ = thr_mma_qk.make_fragment_A(tSsQ);                            // (MMA,MMA_N,MMA_K,PIPE)
+    Tensor tSsQResidual = thr_mma_qk.partition_A(sQResidual);
+    Tensor tSrQResidual = thr_mma_qk.make_fragment_A(tSsQResidual);
     Tensor tSrK = thr_mma_qk.make_fragment_B(tSsK);                            // (MMA,MMA_M,MMA_N,PIPE)
 
     // Prepare: MMA PV
@@ -412,6 +503,11 @@ struct FmhaMainloopTmaWarpSpecialized {
         warpgroup_arrive();
   
         gemm_zero_acc(tiled_mma_qk, tSrQ(_,_,_,smem_pipe_read_q.index()), tSrK(_,_,_,smem_pipe_read.index()), acc_qk);
+        if constexpr (kCompensatedQ) {
+          cute::gemm(tiled_mma_qk,
+                     tSrQResidual(_,_,_,smem_pipe_read_q.index()),
+                     tSrK(_,_,_,smem_pipe_read.index()), acc_qk);
+        }
         warpgroup_commit_batch();
         math_wg_order_barrier.arrive();
 
@@ -458,6 +554,11 @@ struct FmhaMainloopTmaWarpSpecialized {
         warpgroup_arrive();
 
         gemm_zero_acc(tiled_mma_qk, tSrQ(_,_,_,smem_pipe_read_q.index()), tSrK(_,_,_,smem_pipe_read.index()), acc_qk);
+        if constexpr (kCompensatedQ) {
+          cute::gemm(tiled_mma_qk,
+                     tSrQResidual(_,_,_,smem_pipe_read_q.index()),
+                     tSrK(_,_,_,smem_pipe_read.index()), acc_qk);
+        }
         warpgroup_commit_batch();
 
         ++smem_pipe_read;
@@ -511,6 +612,11 @@ struct FmhaMainloopTmaWarpSpecialized {
         warpgroup_arrive();
 
         gemm_zero_acc(tiled_mma_qk, tSrQ(_,_,_,smem_pipe_read_q.index()), tSrK(_,_,_,smem_pipe_read.index()), acc_qk);
+        if constexpr (kCompensatedQ) {
+          cute::gemm(tiled_mma_qk,
+                     tSrQResidual(_,_,_,smem_pipe_read_q.index()),
+                     tSrK(_,_,_,smem_pipe_read.index()), acc_qk);
+        }
         warpgroup_commit_batch();
 
         ++smem_pipe_read;

@@ -57,6 +57,29 @@ namespace kernel {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if defined(FS_CUTLASS_DISAMBIGUATE_CONV_PROBLEM_SHAPE)
+// CUTLASS 3.x convolution kernels reuse GemmUniversal with ConvProblemShape as
+// their first template argument.  When a translation unit also includes the
+// CUTLASS 2.x GemmUniversal adapter, the legacy partial specialization below
+// mistakes that non-tuple problem shape for a 2.x threadblock Mma and overlaps
+// the SM90 3.x specialization.  Keep this FusionSmith compatibility shim
+// default-off and identify only the public ConvProblemShape member contract.
+template <class ProblemShape, class = void>
+struct IsCutlass3ConvProblemShape : cute::false_type { };
+
+template <class ProblemShape>
+struct IsCutlass3ConvProblemShape<
+  ProblemShape,
+  cute::void_t<
+    typename ProblemShape::TensorExtent,
+    typename ProblemShape::TensorStride,
+    decltype(ProblemShape::ConvOp),
+    decltype(ProblemShape::NumSpatialDimensions)
+  >> : cute::true_type { };
+#endif
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <
   typename Mma_,                  ///! Threadblock-scoped matrix multiply-accumulate
   typename Epilogue_,             ///! Epilogue
@@ -69,7 +92,14 @@ class GemmUniversal<
   void,
   // 3.x kernels use the first template argument to define the ProblemShape
   // We use this invariant to SFINAE dispatch against either the 2.x API or the 3.x API
+#if defined(FS_CUTLASS_DISAMBIGUATE_CONV_PROBLEM_SHAPE)
+  cute::enable_if_t<not (
+    cute::is_tuple<Mma_>::value ||
+    IsCutlass3ArrayKernel<Mma_>::value ||
+    IsCutlass3ConvProblemShape<Mma_>::value)>
+#else
   cute::enable_if_t<not (cute::is_tuple<Mma_>::value || IsCutlass3ArrayKernel<Mma_>::value)>
+#endif
 > {
 public:
 

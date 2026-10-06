@@ -74,7 +74,15 @@ public:
       FastDivmodU64 const& divmod_cluster_blk_major,
       int32_t log_swizzle_size,
       RasterOrder raster_order) {
+#if defined(FS_CUTLASS_VIRTUAL_CLUSTER_SIZE_ONE) && \
+    (FS_CUTLASS_VIRTUAL_CLUSTER_SIZE_ONE + 0)
+    // See the matching pingpong-kernel guard: the physical wrapper cluster is
+    // not part of the source CUTLASS scheduler's ClusterShape=1 topology.
+    uint64_t cta_m_in_cluster = 0;
+    uint64_t cta_n_in_cluster = 0;
+#else
     auto [cta_m_in_cluster, cta_n_in_cluster, _] = cute::block_id_in_cluster();
+#endif
     return get_work_idx_m_and_n(
       blk_per_grid_dim,
       divmod_cluster_shape_major,
